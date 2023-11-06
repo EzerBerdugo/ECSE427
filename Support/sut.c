@@ -8,7 +8,7 @@
 #include <arpa/inet.h>
 
 #include "sut.h"
-#include "queue.h"
+#include "/Users/ezerberdugo/Documents/GitHub/ECSE427/Support/queue/queue.h"
 
 #define DES_BUFSIZE 50          // buf size for ip address
 #define READ_BUFSIZE 1024       // buf size for read
