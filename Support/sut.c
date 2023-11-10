@@ -2,10 +2,11 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 
 #include "sut.h"
 #include "/Users/ezerberdugo/Documents/GitHub/ECSE427/Support/queue/queue.h"
@@ -184,58 +185,32 @@ void sut_exit(){
     setcontext(&parent);        // back to parent task
 }
 
-void sut_open(char* destination, int port_num){
-    strcpy(host,destination);           // copy destination address to global variable host
-    port = port_num;                    // copy port number
-    iomessage* message_to_io = (iomessage*)malloc(sizeof(iomessage));   // create an iomessage
-    message_to_io->command = 1;         // set command to open
-    struct queue_entry *to_io = queue_new_node(message_to_io);
-    ucontext_t *cur_task = (ucontext_t*)malloc(sizeof(ucontext_t));     
-    struct queue_entry *back = queue_new_node(cur_task);
-    //lock
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&to_ithread, to_io);      // push iomessage to to_io queue
-    queue_insert_tail(&wait_queue, back);       // push the task to wait queue
-    //unlock
-    pthread_mutex_unlock(&c_lock);
-    swapcontext(cur_task,&parent);              // back to parent task
+int sut_open(char *file_name) {
+    // Open the file in a suitable mode, e.g., read-only or read-write
+    int fd = open(file_name, O_RDONLY); // Example: open for read-only
+    if (fd == -1) {
+        perror("Error opening file");
+        return -1; // Return -1 or another negative value on error
+    }
+    return fd; // Return the file descriptor on success
 }
 
-char* sut_read(){
-    iomessage* message_to_io = (iomessage*)malloc(sizeof(iomessage));
-    message_to_io->command = 3;     //set command to read
-    struct queue_entry *to_io = queue_new_node(message_to_io);
-    ucontext_t *cur_task = (ucontext_t*)malloc(sizeof(ucontext_t));
-    struct queue_entry *back = queue_new_node(cur_task);
-    // lock
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&to_ithread, to_io);  // push iomessage to to_io queue
-    queue_insert_tail(&wait_queue, back);   // push task to wait queue
-    pthread_mutex_unlock(&c_lock);
-    swapcontext(cur_task,&parent);          // back to parent task
-    
-    // when data is ready
-    pthread_mutex_lock(&c_lock);
-    struct queue_entry* data_from_io = queue_pop_head(&from_ithread);   // pop data out
-    pthread_mutex_unlock(&c_lock);
-    memset(read_from_io,0,READ_BUFSIZE);
-    strcpy(read_from_io,data_from_io->data);  // copy the data to read_from_io
-    free(data_from_io->data);                 // memory management
-    free(data_from_io);
-    return read_from_io;                      // return read data
+char *sut_read(int fd, char *buf, int size) {
+    ssize_t bytes_read = read(fd, buf, size);
+    if (bytes_read == -1) {
+        perror("Error reading file");
+        return NULL; // Return NULL on error
+    }
+    buf[bytes_read] = '\0'; // Null-terminate the buffer
+    return buf; // Return the buffer on success
 }
 
-void sut_write(char* buf, int size){        
-    char* selement = (char*)malloc(size);     
-    strcpy(selement,buf);
-    iomessage* message_to_io = (iomessage*)malloc(sizeof(iomessage));   
-    message_to_io->command = 2;             // set command to write
-    message_to_io->ielement = size;         // set write size
-    message_to_io->selement = selement;     // set write string
-    struct queue_entry *to_io = queue_new_node(message_to_io);
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&to_ithread, to_io);  // push to to_io queue
-    pthread_mutex_unlock(&c_lock);
+void sut_write(int fd, char *buf, int size) {
+    ssize_t bytes_written = write(fd, buf, size);
+    if (bytes_written == -1) {
+        perror("Error writing file");
+    }
+    // Optionally, handle partial writes or other specific requirements
 }
 
 void sut_close(int fd){
