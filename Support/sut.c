@@ -1,252 +1,417 @@
-#include <stdbool.h>
+#define STACK_SIZE 1024*1024
+#include <time.h>
+#include <ucontext.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <sys/ucontext.h>
+#include <stdbool.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
+#include <unistd.h>
 
+#include "queue.h"
 #include "sut.h"
-#include "/Users/ezerberdugo/Documents/GitHub/ECSE427/Support/queue/queue.h"
 
-#define DES_BUFSIZE 50          // buf size for ip address
-#define READ_BUFSIZE 1024       // buf size for read
-#define STACK_SIZE 16 * 1024    // stack size for ucontext
 
-/**
- * message struct for IO queue (to_ithread and from_ithread)
- **/
-typedef struct iomessage{
-    int command;    // 1 for open, 2 for write, 3 for read, 4 for close
-    char* selement; // string element
-    int ielement;   // integer element
-}iomessage;
+bool running = false; 
+static struct timespec times = { .tv_sec = 0, .tv_nsec = 100000 };
+struct queue QueueReady, QueueWait;
+pthread_mutex_t QueueReadyMutex;
+pthread_mutex_t QueueWaitMutex;
+pthread_t *EXECc;
+pthread_t *EXECi;
+ucontext_t EXECcMain;
+TCB *task = NULL;
+TCB *IOtask = NULL;
 
-void connection_initialize();   // initialization function for tcp connection
-void connection_shutdown();     // close function for tcp connection
-void clean_up();                // clean up function for shutdown 
 
-struct queue c_queue;           // ready queue
-struct queue wait_queue;        // wait queue
-struct queue to_ithread;        // to_IO queue (send message to ithread)
-struct queue from_ithread;      // from_IO queue (read from ithread)
+typedef struct {
+    ucontext_t context;   
+    char *stack;          
+    sut_task_f func;     
+    bool task_is_complete; 
 
-pthread_t c_thread_handle;      // C thread handler
-pthread_t i_thread_handle;      // I thread handler
+    io_operation_t opIO;
+    bool pendingIO;        
+    char *resultIO;      
+    char *fileIO;         
+    char *bufIO;       
+    int sizeIO;           
+    int fileDesc;       
+  
+} TCB;
 
-ucontext_t parent;              // parent task
-ucontext_t template;            // task template for new tasks
+typedef enum {
+    noneIO,
+    openIO,
+    readIO,
+    writeIO,
+    closeIO 
+} io_operation_t;
 
-pthread_mutex_t c_lock = PTHREAD_MUTEX_INITIALIZER;     //mutex lock
 
-int sockfd;         // sock number
-char* host;         // ip host
-int port;           // port number
+void Cexec() {
+    while (running) {
+        pthread_mutex_lock(&QueueReadyMutex);
 
-char* read_from_io; // to save content popped from from_IO queue
+        struct queue_entry *nextNode = queue_peek_front(&QueueReady);
 
-struct queue_entry* next = NULL;    // next task from the ready queue
+        if (nextNode) {
+            queue_pop_head(&QueueReady);
 
-bool shutdown_flag = false;         // indicate whether all tasks are created
-bool shutdown_c_flag = false;       // indicate whether all tasks are cleared from ready and wait queue
+            TCB* nextTask = (TCB*)nextNode->data;
+            task = nextTask;
 
-void* cthread(){
-    getcontext(&template);                  // get a template ucontext for future new task
-    while(true){
-        if(next!=NULL){                     // memory management
-            free(next);
-        }
-        pthread_mutex_lock(&c_lock);
-        next = queue_pop_head(&c_queue);    // next task from ready queue
-        pthread_mutex_unlock(&c_lock);
-        if(next != NULL){
-            swapcontext(&parent,(ucontext_t*)next->data);       //save status to parent and switch to next ready task
-        }else{
-            if(shutdown_flag){              // if all tasks created
-                void* check_c;
-                void* check_wait;
-                pthread_mutex_lock(&c_lock);
-                check_c = queue_peek_front(&c_queue);           // check ready queue
-                check_wait = queue_peek_front(&wait_queue);     // check wait queue
-                pthread_mutex_unlock(&c_lock);
-                if(check_c == NULL && check_wait ==NULL){       // if both ready and wait queue are NULL
-                    shutdown_c_flag = true;                     // thread shutdown flag = true
-                    pthread_exit(NULL);                         // exit thread
+            free(nextNode);
+            pthread_mutex_unlock(&QueueReadyMutex);
+            printf("Switching context to task at %p\n", (void*)nextTask);
+            swapcontext(&EXECcMain, &nextTask->context);
+
+            if (task != NULL && task->task_is_complete) {
+                free(task->stack);
+
+                if (task->fileIO != NULL) {
+                    free(task->fileIO);
+                    task->fileIO = NULL;
                 }
-                usleep(100);                // sleep for 100 us
-            }else{
-                usleep(100);                // sleep for 100 us
+
+                free(task);
+                task = NULL;
             }
+        } else {
+            pthread_mutex_unlock(&QueueReadyMutex);
+            nanosleep(&times, NULL);
         }
     }
 }
 
-void* ithread(){
-    struct queue_entry* next_io = NULL;           // use to save next io task
-    int command_opt;                              // command option: 1 for open, 2 for write, 3 for read, 4 for close 
-    while(true){
-        pthread_mutex_lock(&c_lock);
-        next_io = queue_pop_head(&to_ithread);    // next io task
-        pthread_mutex_unlock(&c_lock);
-        if (next_io != NULL){                     // if next io task not NULL
-            command_opt = ((iomessage*)(next_io->data))->command;         // get io task
-            if(command_opt == 1){                 // open task
-                connection_initialize();          // initialize tcp connection
-                pthread_mutex_lock(&c_lock);
-                queue_insert_tail(&c_queue, queue_pop_head(&wait_queue)); // push the task from wait queue back to ready queue
-                pthread_mutex_unlock(&c_lock);    
-            }else if(command_opt == 2){           // write task
-                send(sockfd, ((iomessage*)(next_io->data))->selement, ((iomessage*)(next_io->data))->ielement, 0);  // send message to destination
-                free(((iomessage*)(next_io->data))->selement);            // memory management
-            }else if(command_opt == 3){           // read task
-                int flag = -1;                    // flag to indicate whether the message from the server is reveived successfully
-                char* from_io = (char*)malloc(READ_BUFSIZE);              // malloc memory to receive data
-                memset(from_io, 0, sizeof(READ_BUFSIZE));
-                while(flag<0){                    // if flag < 0, keep receiving
-                    flag = recv(sockfd, from_io, READ_BUFSIZE, 0);
-                }
-                pthread_mutex_lock(&c_lock);
-                queue_insert_tail(&from_ithread, queue_new_node(from_io));// push the read data to from_io queue
-                queue_insert_tail(&c_queue, queue_pop_head(&wait_queue)); // move the task from wait queue to ready queue
-                pthread_mutex_unlock(&c_lock);
-            }else if (command_opt == 4){          // close task
-                connection_shutdown();            // close tcp connection
+
+void Iexec() {
+
+    while (running) {
+
+        pthread_mutex_lock(&QueueWaitMutex);
+
+        struct queue_entry *nextNode = queue_peek_front(&QueueWait);
+
+        if (IOtask->opIO == openIO) {
+                IOtask->fileDesc = open(IOtask->fileIO, O_RDWR | O_CREAT, 0666);
+                IOtask->pendingIO = false;   
+    
+                pthread_mutex_lock(&QueueReadyMutex);
+                queue_insert_tail(&QueueReady, queue_new_node(IOtask));
+                pthread_mutex_unlock(&QueueReadyMutex);
+
+                IOtask = NULL;
+
+        if (nextNode) {
+            queue_pop_head(&QueueWait);
+            IOtask = (TCB*)nextNode->data;
+            free(nextNode);
+            pthread_mutex_unlock(&QueueWaitMutex);
+
+            }else if (IOtask->opIO == readIO) {
+                ssize_t ReadBytes = read(IOtask->fileDesc, IOtask->bufIO, IOtask->sizeIO);
+
+                IOtask->resultIO = (ReadBytes > 0) ? IOtask->bufIO : NULL;
+                IOtask->pendingIO = false;
+
+                pthread_mutex_lock(&QueueReadyMutex);
+                queue_insert_tail(&QueueReady, queue_new_node(IOtask));
+                pthread_mutex_unlock(&QueueReadyMutex);
+
+                IOtask = NULL;
+
+            } else if (IOtask->opIO == writeIO) {
+                ssize_t WrittenBytes = write(IOtask->fileDesc, IOtask->bufIO, IOtask->sizeIO);
+                IOtask->pendingIO = false;
+
+                pthread_mutex_lock(&QueueReadyMutex);
+                queue_insert_tail(&QueueReady, queue_new_node(IOtask));
+                pthread_mutex_unlock(&QueueReadyMutex);
+
+                IOtask = NULL;
+
+            } else if (IOtask->opIO == closeIO){
+                   if (close(IOtask->fileDesc) == -1) {
+                         perror("close");
+                    } else {
+                pthread_mutex_lock(&QueueReadyMutex);
+                queue_insert_tail(&QueueReady, queue_new_node(IOtask));
+                pthread_mutex_unlock(&QueueReadyMutex);
+
+                IOtask->pendingIO = false;
+                IOtask = NULL;
+                    }
             }
-            free((next_io->data));                // free iomessage struct
-            free(next_io);                        // free next_io node
-        }else{
-            if(shutdown_flag&&shutdown_c_flag){   // if no tasks in ready and wait queue
-                clean_up();                       // clean up memory
-                pthread_exit(NULL);               // exit thread
-            }else{
-                usleep(100);                      // wait for 100 us
-            }
+        } else {
+            pthread_mutex_unlock(&QueueWaitMutex);
+            nanosleep(&times, NULL);
         }
     }
 }
 
-void sut_init(){
-    // create and init four queues
-    c_queue = queue_create();           // ready queue
-    queue_init(&c_queue);
-    wait_queue = queue_create();        // wait queue
-    queue_init(&wait_queue);
-    to_ithread = queue_create();        // to_IO queue
-    queue_init(&to_ithread);
-    from_ithread = queue_create();      // from_IO queue
-    queue_init(&from_ithread);
 
-    host = (char*)malloc(DES_BUFSIZE);  // malloc memory for host ip address
 
-    read_from_io = (char*)malloc(READ_BUFSIZE); // malloc for read from IO data
+void sut_init() {
+    running = true;
 
-    // create 2 kernel level threads
-    pthread_create(&c_thread_handle, NULL, cthread, &c_lock);   // C-EXEC
-    pthread_create(&i_thread_handle, NULL, ithread, &c_lock);   // I-EXEC
+    QueueReady = queue_create();
+    QueueWait = queue_create();
+
+    queue_init(&QueueReady);
+    queue_init(&QueueWait);
+
+    EXECc = (pthread_t *)malloc(sizeof(pthread_t));
+    EXECi = (pthread_t *)malloc(sizeof(pthread_t));
+
+    pthread_mutex_init(&QueueReadyMutex, NULL);
+    pthread_mutex_init(&QueueWaitMutex, NULL);
+
+    if (pthread_create(EXECc, NULL, (void *(*)(void *))Cexec, NULL) != 0) {
+        fprintf(stderr, "Error creating C-EXEC thread\n");
+        return;
+    }
+
+    if (pthread_create(EXECi, NULL, (void *(*)(void *))Iexec, NULL) != 0) {
+        fprintf(stderr, "Error creating I-EXEC thread\n");
+        return;
+    }
+
+    getcontext(&EXECcMain);
 }
 
-bool sut_create(sut_task_f fn){
-    if(fn == NULL){       // if function pointer is NULL, return false
+
+bool sut_create(sut_task_f fn) {
+    TCB* NewTask = (TCB*)malloc(sizeof(TCB));
+    if (!NewTask) {
         return false;
     }
-    ucontext_t* new = (ucontext_t*)malloc(sizeof(ucontext_t));
-    char* new_stack = (char*)malloc(STACK_SIZE);
-    memcpy(new,&template,sizeof(ucontext_t));
-    new->uc_stack.ss_sp = new_stack;            // new stack pointer
-    new->uc_stack.ss_size = sizeof(new_stack);  // size of stack
-    new->uc_link = &parent;                     // link back to parent if task is done
-    makecontext(new, fn, 0);
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&c_queue, queue_new_node(new));   // push to ready queue
-    pthread_mutex_unlock(&c_lock);
+
+    NewTask->stack = (char *)malloc(STACK_SIZE);
+    if (!NewTask->stack) {
+        free(NewTask);
+        return false;
+    }
+
+    if (getcontext(&NewTask->context) == -1) {
+        free(NewTask->stack);
+        free(NewTask);
+        return false;
+    }
+
+    NewTask->func = fn;
+    NewTask->task_is_complete = false;
+    NewTask->opIO = noneIO;
+    NewTask->fileIO = NULL;
+    NewTask->bufIO = NULL;
+    NewTask->sizeIO = 0;
+    NewTask->fileDesc = -1;
+    NewTask->pendingIO = false;
+
+    NewTask->context.uc_stack.ss_sp = NewTask->stack;
+    NewTask->context.uc_stack.ss_size = STACK_SIZE;
+    NewTask->context.uc_stack.ss_flags = 0;
+    NewTask->context.uc_link = &EXECcMain;
+    makecontext(&NewTask->context, (void(*)())fn, 0);
+
+    struct queue_entry *node = queue_new_node(NewTask);
+    if (!node) {
+        free(NewTask->stack);
+        free(NewTask);
+        return false;
+    }
+
+    pthread_mutex_lock(&QueueReadyMutex);
+    queue_insert_tail(&QueueReady, node);
+    pthread_mutex_unlock(&QueueReadyMutex);
+
     return true;
 }
 
-void sut_shutdown(){
-    shutdown_flag = true;                   // indicate all tasks are created
-    pthread_join(c_thread_handle,NULL);     // wait for C-EXEC to complete
-    pthread_join(i_thread_handle,NULL);     // wait for I-EXEC to complete
-}
+void sut_yield() {
+    pthread_mutex_lock(&QueueReadyMutex);
 
-void sut_yield(){
-    ucontext_t *cur_task = (ucontext_t*)malloc(sizeof(ucontext_t));     // create a new ucontext
-    struct queue_entry *back = queue_new_node(cur_task);                // create a new node for ready queue
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&c_queue, back);      // push back to ready queue
-    pthread_mutex_unlock(&c_lock);
-    swapcontext(cur_task,&parent);          // save current task status and swap with parent task
-}
+    struct queue_entry *node = queue_new_node(task);
+    if (!node) {
 
-void sut_exit(){
-    free(((ucontext_t*)(next->data))->uc_stack.ss_sp);  // free stack
-    free((ucontext_t*)(next->data));                    // free ucontext_t
-    setcontext(&parent);        // back to parent task
-}
-
-int sut_open(char *file_name) {
-    // Open the file in a suitable mode, e.g., read-only or read-write
-    int fd = open(file_name, O_RDONLY); // Example: open for read-only
-    if (fd == -1) {
-        perror("Error opening file");
-        return -1; // Return -1 or another negative value on error
+        pthread_mutex_unlock(&QueueReadyMutex);
+        return;
     }
-    return fd; // Return the file descriptor on success
+    queue_insert_tail(&QueueReady, node);
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+
+    if (swapcontext(&task->context, &EXECcMain) == -1) {
+    }
 }
 
-char *sut_read(int fd, char *buf, int size) {
-    ssize_t bytes_read = read(fd, buf, size);
-    if (bytes_read == -1) {
-        perror("Error reading file");
-        return NULL; // Return NULL on error
-    }
-    buf[bytes_read] = '\0'; // Null-terminate the buffer
-    return buf; // Return the buffer on success
+
+void sut_exit() {
+    pthread_mutex_lock(&QueueReadyMutex);
+
+    task->task_is_complete = true;
+
+    printf("exiting: %p\n ", (void *)task);
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+
+    setcontext(&EXECcMain);
 }
+
+
+
+int sut_open(char *fname) {
+    pthread_mutex_lock(&QueueReadyMutex);
+    pthread_mutex_lock(&QueueWaitMutex);
+
+    task->opIO = openIO;
+    task->fileIO = strdup(fname);
+    task->pendingIO = true;
+
+    queue_insert_tail(&QueueWait, queue_new_node(task));
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+    pthread_mutex_unlock(&QueueWaitMutex);
+
+    if (swapcontext(&task->context, &EXECcMain) == -1) {
+    }
+
+    return task->fileDesc;
+}
+
+
 
 void sut_write(int fd, char *buf, int size) {
-    ssize_t bytes_written = write(fd, buf, size);
-    if (bytes_written == -1) {
-        perror("Error writing file");
-    }
-    // Optionally, handle partial writes or other specific requirements
-}
+    pthread_mutex_lock(&QueueReadyMutex);
+    pthread_mutex_lock(&QueueWaitMutex);
 
-void sut_close(int fd){
-    //close the socket
-   // char* pointed_file = (char*)sut_read(int fd, char buf, int size);
-    iomessage* message_to_io = (iomessage*)malloc(sizeof(iomessage));
-    message_to_io->command = 4;             // set command to close
-    struct queue_entry *to_io = queue_new_node(message_to_io);
-    pthread_mutex_lock(&c_lock);
-    queue_insert_tail(&to_ithread, to_io);  // push to to_io queue
-    pthread_mutex_unlock(&c_lock);
-    
-}
+    task->opIO = writeIO;
+    task->fileDesc = fd;
+    task->bufIO = buf;
+    task->sizeIO = size;
+    task->pendingIO = true;
 
-void connection_initialize(){
-    struct sockaddr_in server_address = { 0 };
-    // create a new socket
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-      perror("Failed to create a new socket\n");
-    }
-    // connect to server
-    server_address.sin_family = AF_INET;
-    inet_pton(AF_INET, host, &(server_address.sin_addr.s_addr));
-    server_address.sin_port = htons(port);
-    if (connect(sockfd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-      perror("Failed to connect to server\n");
+    queue_insert_tail(&QueueWait, queue_new_node(task));
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+    pthread_mutex_unlock(&QueueWaitMutex);
+
+    if (swapcontext(&task->context, &EXECcMain) == -1) {
     }
 }
 
-void connection_shutdown(){
-    shutdown(sockfd, SHUT_WR);  // shutdown write
-    shutdown(sockfd, SHUT_RD);  // shutdown read
-    close(sockfd);              // close socket
+
+
+void sut_close(int fd) {
+    pthread_mutex_lock(&QueueReadyMutex);
+    pthread_mutex_lock(&QueueWaitMutex);
+
+    task->opIO = closeIO;
+    task->fileDesc = fd;
+    task->pendingIO = true;
+
+    queue_insert_tail(&QueueWait, queue_new_node(task));
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+    pthread_mutex_unlock(&QueueWaitMutex);
+
+    if (swapcontext(&task->context, &EXECcMain) == -1) {
+    }
 }
 
-void clean_up(){
-    free(host);                 // free host string
+
+
+char* sut_read(int fd, char *buf, int size) {
+    pthread_mutex_lock(&QueueReadyMutex);
+    pthread_mutex_lock(&QueueWaitMutex);
+
+    task->opIO = readIO;
+    task->fileDesc = fd;
+    task->bufIO = buf;
+    task->sizeIO = size;
+    task->pendingIO = true;
+    task->resultIO = NULL;
+
+    queue_insert_tail(&QueueWait, queue_new_node(task));
+
+    pthread_mutex_unlock(&QueueReadyMutex);
+    pthread_mutex_unlock(&QueueWaitMutex);
+
+    if (swapcontext(&task->context, &EXECcMain) == -1) {
+    }
+
+    return task->resultIO;
+}
+
+
+void queue_cleanup(struct queue *q) {
+    while (!STAILQ_EMPTY(q)) {
+        struct queue_entry *entry = STAILQ_FIRST(q);
+        STAILQ_REMOVE_HEAD(q, entries);
+
+        TCB *task = (TCB *)entry->data;
+        if (task != NULL) {
+            if (task->fileIO != NULL) {
+                free(task->fileIO);
+                task->fileIO = NULL;
+            }
+            if (task->stack != NULL) {
+                free(task->stack);
+                task->stack = NULL;
+            }
+            free(task);
+        }
+
+        free(entry);
+    }
+}
+
+
+void sut_shutdown() {
+
+    while (true) {
+        pthread_mutex_lock(&QueueReadyMutex);
+        pthread_mutex_lock(&QueueWaitMutex);
+
+        bool ready_queue_empty = STAILQ_EMPTY(&QueueReady);
+        bool wait_queue_empty = STAILQ_EMPTY(&QueueWait);
+        
+        pthread_mutex_unlock(&QueueWaitMutex);
+        pthread_mutex_unlock(&QueueReadyMutex);
+
+        bool tasks_completed = true;
+
+        if (task != NULL) {
+            tasks_completed &= task->task_is_complete;
+        }
+        if (IOtask != NULL) {
+            tasks_completed &= IOtask->task_is_complete;
+        }
+
+        if (ready_queue_empty && wait_queue_empty && tasks_completed) {
+            break;
+        }
+
+        nanosleep(&times, NULL);
+    }
+
+
+    queue_cleanup(&QueueReady);
+    queue_cleanup(&QueueWait);
+
+    running = false;
+
+    if (EXECc != NULL) {
+        pthread_join(*EXECc, NULL);
+        free(EXECc);
+        EXECc = NULL;
+    }
+
+    if (EXECi != NULL) {
+        pthread_join(*EXECi, NULL);
+        free(EXECi);
+        EXECi = NULL;
+    }
+
+    pthread_mutex_destroy(&QueueReadyMutex);
+    pthread_mutex_destroy(&QueueWaitMutex);
 }

@@ -1,6 +1,9 @@
 {
     "files.associations": {
         "queue.h": "c",
-        "setjmp.h": "c"
+        "setjmp.h": "c",
+        "__threading_support": "c",
+        "pthread.h": "c",
+        "fcntl.h": "c"
     }
 }
