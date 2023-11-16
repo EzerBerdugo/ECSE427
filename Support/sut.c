@@ -56,8 +56,7 @@ TCB *currentIOTask = NULL;
 
 void Iexec() {
 
-    while (running
-) {
+    while (running) {
 
         pthread_mutex_lock(&QueueWaitMutex);
 
@@ -118,6 +117,7 @@ void Iexec() {
         }
     }
 }
+
 
 void Cexec() {
     while (running) { 
@@ -204,6 +204,7 @@ bool sut_create(sut_task_f fn) {
     return true; 
 }
 
+
 void sut_init() {
     running= true;
 
@@ -253,7 +254,6 @@ void sut_yield() {
 
 
 
-
 int sut_open(char *fname) {
     pthread_mutex_lock(&QueueReadyMutex);
     pthread_mutex_lock(&QueueWaitMutex);
@@ -285,7 +285,6 @@ void sut_exit() {
 
     setcontext(&CexecMain);
 }
-
 
 
 void sut_close(int fd) {
